@@ -330,3 +330,138 @@ address InterpreterGenerator::generate_normal_entry(bool synchronized) {
 ```
 > 这个函数会在JVM启动过程中调用，执行完成后，会向JVM的代码缓存区写入对应的本地机器指令，当JVM调用一个特定的Java方法时，会根据Java方法所对应的类型找到对应的函数入口，并执行这段预先生成好的机器指令。
 
+## 局部变量表创建
+### constMethod的内存布局
+
+对于JDK6，JVM内部通过偏移量为Java函数定义了以下规则：
+- method对象的constMethod指针紧跟在methodOop对象头后面，也即constMethod的偏移量固定
+- constMethod内部存储Java函数所对应的字节码指令的位置相对于constMethod起始位的偏移量固定
+- method对象内部存储Java函数的参数数量、局部变量数量的参数的偏移量是固定的。
+
+JDK6的method机器相关属性的偏移量：
+methodOopDesc内存布局.png
+
+> max_locals与size_of_parameters这两个参数相对于methodOop对象头的偏移量分别是38与36，JVM将会基于此计算局部变量表的大小。JDK8中，由于这两个参数恒定不变，因此将其当做只读属性，移到了constMethod对象中。
+
+### 局部变量表空间计算
+> 局部变量表包含Java方法的所有入参和方法内部所声明的全部局部变量。
+举例说明
+```
+public class A {
+    public void add(int x,int y){
+        int z = x + y;
+    }
+}
+```
+使用javap -verbose分析：
+
+```
+  public void add(int, int);
+    descriptor: (II)V
+    flags: ACC_PUBLIC
+    Code:
+      stack=2, locals=4, args_size=3
+         0: iload_1
+         1: iload_2
+         2: iadd
+         3: istore_3
+         4: return
+      LineNumberTable:
+        line 5: 0
+        line 6: 4
+```
+> 可以看到add方法的局部变量表的最大容量是4，入参数量是3，这是因为add方法是类的成员方法，因此会有一个隐藏的第一个入参this。3个入参加上内部定义的局部变量z构成了局部变量表。
+
+
+```
+0: iload_1
+1: iload_2
+这两条字节码指令分别将局部变量表的第一个槽位x和第二个槽位y的数据推送至表达式栈栈顶，
+（槽位标号从0开始，很显然第0号槽位是this）
+istore_3
+这条字节码指令将计算结果板寸到局部变量表的第三个槽位，正是定义的局部变量z
+```
+> 对于本例，x和y这两个入参在调用方法调用add时便已经分配完毕，因此JVM只需为z分配堆栈空间，而z所需要的堆栈空间大小就是编译期间计算出的局部变量表的大小减去入参数量。entry_point隔出了这种方法：
+
+```
+ const Address size_of_parameters(rbx, methodOopDesc::size_of_parameters_offset());
+  const Address size_of_locals    (rbx, methodOopDesc::size_of_locals_offset());
+  const Address invocation_counter(rbx, methodOopDesc::invocation_counter_offset() + InvocationCounter::counter_offset());
+  const Address access_flags      (rbx, methodOopDesc::access_flags_offset());
+
+  // get parameter size (always needed)
+  __ load_unsigned_short(rcx, size_of_parameters);
+
+  // rbx,: methodOop
+  // rcx: size of parameters
+
+  // rsi: sender_sp (could differ from sp+wordSize if we were called via c2i )
+
+  __ load_unsigned_short(rdx, size_of_locals);       // get size of locals in words
+  __ subl(rdx, rcx);                                // rdx = no. of additional locals
+```
+这段代码最终生成的机器指令是：
+```
+movl 0x26(%ebx),%ecx
+movl 0x24(%ebx),%edx
+sub %ecx,%edx
+```
+
+### 初始化局部变量区
+在CallStub执行call %eax指令前，物理寄存器中所保存的重要信息如下：
+寄存器名|指向|
+---|---
+edx|parameters首地址
+ecx|Java函数入参数量
+ebx|指向Java函数，即Java函数所对应的的method对象
+esi|CallStub栈顶
+
+在entry_point历程中，分配堆栈空间时进行push操作：
+
+```
+// get return address获取返回地址
+  __ pop(rax);
+
+  // compute beginning of parameters (rdi)计算第一个入参在堆栈中的地址
+  __ lea(rdi, Address(rsp, rcx, Interpreter::stackElementScale(), -wordSize));
+
+  // rdx - # of additional locals
+  // allocate space for locals
+  // explicitly initialize locals 为局部变量slot（不包含入参）分配堆栈空间，初始化为0
+  {
+    Label exit, loop;
+    __ testl(rdx, rdx);
+    __ jcc(Assembler::lessEqual, exit);               // do nothing if rdx <= 0
+    __ bind(loop);
+    __ push((int32_t)NULL_WORD);                      // initialize local variables
+    __ decrement(rdx);                                // until everything initialized
+    __ jcc(Assembler::greater, loop);
+    __ bind(exit);
+  }
+```
+这段逻辑执行了三件事：
+- 将栈顶的返回值暂存到rax寄存器
+- 获取Java函数第一个入参在堆栈的位置
+- 为局部变量表分配堆栈空间
+
+#### 1 暂存返回地址
+> JVM为了实现操作数栈与局部变量表的复用，要将接下来被调用的Java方法分配局部变量的堆栈空间与被调用的Java方法的入参区域连城一块，而中间又间隔了return address，所以要将他暂存起来（pop %eax）
+
+#### 2 获取Java函数第一个入参在堆栈的位置
+> 这一步将第一个入参的位置保存在edi寄存器中，因为JVM是基于局部变量表的起始位置做偏移的。
+
+#### 3 为局部变量表分配堆栈空间
+
+```
+{
+    Label exit, loop;
+    __ testl(rdx, rdx);
+    __ jcc(Assembler::lessEqual, exit);               // do nothing if rdx <= 0
+    __ bind(loop);
+    __ push((int32_t)NULL_WORD);                      // initialize local variables
+    __ decrement(rdx);                                // until everything initialized
+    __ jcc(Assembler::greater, loop);
+    __ bind(exit);
+  }
+```
+> 这一段指令的逻辑是，先测试edx是否为0，如果为0则没有定义局部变量，直接跳过分配堆栈步骤，否则的话执行循环，通过__ push((int32_t)NULL_WORD);                      // initialize local variables向栈顶压入一个0，然后edx-1，一直进行到edx为0。这么做的原因是可以在分配堆栈空间的同时，将堆栈清零。
