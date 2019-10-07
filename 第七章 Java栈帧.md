@@ -423,8 +423,7 @@ esi|CallStub栈顶
   __ pop(rax);
 
   // compute beginning of parameters (rdi)计算第一个入参在堆栈中的地址
-  __ lea(rdi, Address(rsp, rcx, Interpreter::stackElementScale(), -wordSize));
-
+  __ lea(rdi, Address(rsp, rcx, Interpreter::stackElementScale(), -wordSize)); 
   // rdx - # of additional locals
   // allocate space for locals
   // explicitly initialize locals 为局部变量slot（不包含入参）分配堆栈空间，初始化为0
@@ -465,3 +464,6 @@ esi|CallStub栈顶
   }
 ```
 > 这一段指令的逻辑是，先测试edx是否为0，如果为0则没有定义局部变量，直接跳过分配堆栈步骤，否则的话执行循环，通过__ push((int32_t)NULL_WORD);                      // initialize local variables向栈顶压入一个0，然后edx-1，一直进行到edx为0。这么做的原因是可以在分配堆栈空间的同时，将堆栈清零。
+
+## 堆栈与栈帧
+> 为局部变量分配完堆栈空间后，接着就要构建Java方法所对应的栈帧中的固定部分（fixed frame），
